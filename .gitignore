@@ -3,3 +3,4 @@
 *.obj
 *.pdb
 *.ilk
+regression_tests

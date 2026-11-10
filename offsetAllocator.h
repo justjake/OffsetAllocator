@@ -273,9 +273,9 @@ static uint32_t OffsetAllocator_InsertNodeIntoBin(OffsetAllocator* allocator, ui
         
     // Take a freelist node and insert on top of the bin linked list (next = old top)
     uint32_t topNodeIndex = allocator->binIndices[binIndex];
-    uint32_t nodeIndex = allocator->freeNodes[allocator->freeOffset--];
+    uint32_t nodeIndex = allocator->freeNodes[--allocator->freeOffset];
 #ifdef OFFSET_ALLOCATOR_DEBUG_VERBOSE
-    printf("Getting node %u from freelist[%u]\n", nodeIndex, allocator->freeOffset + 1);
+    printf("Getting node %u from freelist[%u]\n", nodeIndex, allocator->freeOffset);
 #endif
     OffsetAllocatorNode node = {
         .dataOffset = dataOffset, 
@@ -337,9 +337,9 @@ static void OffsetAllocator_RemoveNodeFromBin(OffsetAllocator* allocator, uint32
         
     // Insert the node to freelist
 #ifdef OFFSET_ALLOCATOR_DEBUG_VERBOSE
-    printf("Putting node %u into freelist[%u] (removeNodeFromBin)\n", nodeIndex, allocator->freeOffset + 1);
+    printf("Putting node %u into freelist[%u] (removeNodeFromBin)\n", nodeIndex, allocator->freeOffset);
 #endif
-    allocator->freeNodes[++allocator->freeOffset] = nodeIndex;
+    allocator->freeNodes[allocator->freeOffset++] = nodeIndex;
 
     allocator->freeStorage -= node->dataSize;
 #ifdef OFFSET_ALLOCATOR_DEBUG_VERBOSE
@@ -362,7 +362,8 @@ size_t OffsetAllocator_GetRequiredBytes(uint32_t maxAllocs)
     #pragma warning(pop)
 #endif
 
-    return sizeof(OffsetAllocator) + (sizeof(OffsetAllocatorNode) + sizeof(OffsetAllocatorNodeIndex))*maxAllocs;
+    return sizeof(OffsetAllocator) +
+        (sizeof(OffsetAllocatorNode) + sizeof(OffsetAllocatorNodeIndex)) * ((size_t)maxAllocs + 1);
 }
 
 OFFSET_ALLOCATOR_API_IMPL 
@@ -382,7 +383,7 @@ OffsetAllocator* OffsetAllocator_Create(uint32_t maxSize, uint32_t maxAllocs, vo
 
     allocator->maxSize = maxSize;
     allocator->maxAllocs = maxAllocs;
-    allocator->freeOffset = maxAllocs - 1;
+    allocator->freeOffset = maxAllocs + 1;
 
     for (uint32_t i = 0 ; i < OFFSET_ALLOCATOR_NUM_TOP_BINS; i++)
         allocator->usedBins[i] = 0;
@@ -391,12 +392,12 @@ OffsetAllocator* OffsetAllocator_Create(uint32_t maxSize, uint32_t maxAllocs, vo
         allocator->binIndices[i] = OFFSET_ALLOCATOR_UNUSED;
 
     allocator->nodes = (OffsetAllocatorNode*)bufferPtr;
-    bufferPtr += sizeof(OffsetAllocatorNode)*maxAllocs;
+    bufferPtr += sizeof(OffsetAllocatorNode)*((size_t)maxAllocs + 1);
 
     allocator->freeNodes = (OffsetAllocatorNodeIndex*)bufferPtr;
 
     // Freelist is a stack. Nodes in inverse order so that [0] pops first.
-    for (uint32_t i = 0; i < maxAllocs; i++)
+    for (uint32_t i = 0; i <= maxAllocs; i++)
     {
         OffsetAllocatorNode* node = &allocator->nodes[i];
         node->dataOffset = 0;
@@ -407,7 +408,7 @@ OffsetAllocator* OffsetAllocator_Create(uint32_t maxSize, uint32_t maxAllocs, vo
         node->neighborNext = OFFSET_ALLOCATOR_UNUSED;
         node->used = false;
 
-        allocator->freeNodes[i] = maxAllocs - i - 1;
+        allocator->freeNodes[i] = maxAllocs - i;
     }
         
     // Start state: Whole storage as one big node
@@ -429,7 +430,7 @@ void OffsetAllocator_Reset(OffsetAllocator* allocator)
 {
     allocator->freeStorage = 0;
     allocator->usedBinsTop = 0;
-    allocator->freeOffset = allocator->maxAllocs - 1;
+    allocator->freeOffset = allocator->maxAllocs + 1;
 
     for (uint32_t i = 0 ; i < OFFSET_ALLOCATOR_NUM_TOP_BINS; i++)
         allocator->usedBins[i] = 0;
@@ -438,7 +439,7 @@ void OffsetAllocator_Reset(OffsetAllocator* allocator)
         allocator->binIndices[i] = OFFSET_ALLOCATOR_UNUSED;
 
     // Freelist is a stack. Nodes in inverse order so that [0] pops first.
-    for (uint32_t i = 0; i < allocator->maxAllocs; i++)
+    for (uint32_t i = 0; i <= allocator->maxAllocs; i++)
     {
         OffsetAllocatorNode* node = &allocator->nodes[i];
         node->dataOffset = 0;
@@ -449,7 +450,7 @@ void OffsetAllocator_Reset(OffsetAllocator* allocator)
         node->neighborNext = OFFSET_ALLOCATOR_UNUSED;
         node->used = false;
 
-        allocator->freeNodes[i] = allocator->maxAllocs - i - 1;
+        allocator->freeNodes[i] = allocator->maxAllocs - i;
     }
 
     // Start state: Whole storage as one big node
@@ -491,34 +492,75 @@ bool OffsetAllocator_Allocate(OffsetAllocator* allocator, uint32_t size, OffsetA
         leafBinIndex = OffsetAllocator_FindLowestSetBitAfter(allocator->usedBins[topBinIndex], minLeafBinIndex);
     }
     
+    uint32_t nodeIndex;
+
     // If we didn't find space in top bin, we search top bin from +1
     if (leafBinIndex == OFFSET_ALLOCATOR_NO_SPACE)
     {
         topBinIndex = OffsetAllocator_FindLowestSetBitAfter(allocator->usedBinsTop, minTopBinIndex + 1);
-            
-        // Out of space?
-        if (topBinIndex == OFFSET_ALLOCATOR_NO_SPACE)
+
+        if (topBinIndex != OFFSET_ALLOCATOR_NO_SPACE)
+        {
+            // All leaf bins here fit the alloc, since the top bin was rounded up. Start leaf search from bit 0.
+            // NOTE: This search can't fail since at least one leaf bit was set because the top bit was set.
+            leafBinIndex = OffsetAllocator_tzcnt_nonzero(allocator->usedBins[topBinIndex]);
+        }
+    }
+
+    uint32_t binIndex;
+    if (leafBinIndex != OFFSET_ALLOCATOR_NO_SPACE)
+    {
+        binIndex = (topBinIndex << OFFSET_ALLOCATOR_TOP_BINS_INDEX_SHIFT) | leafBinIndex;
+        nodeIndex = allocator->binIndices[binIndex];
+    }
+    else
+    {
+        // A free region may round down into the request's bin while being
+        // large enough for the request. Walk only that bin and require an
+        // exact size check so this fallback cannot return an overlap.
+        binIndex = OffsetAllocator_UintToFloatRoundDown(size);
+        topBinIndex = binIndex >> OFFSET_ALLOCATOR_TOP_BINS_INDEX_SHIFT;
+        leafBinIndex = binIndex & OFFSET_ALLOCATOR_LEAF_BINS_INDEX_MASK;
+        nodeIndex = OFFSET_ALLOCATOR_UNUSED;
+        if ((allocator->usedBins[topBinIndex] & (1 << leafBinIndex)) != 0)
+        {
+            uint32_t candidate = allocator->binIndices[binIndex];
+            while (candidate != OFFSET_ALLOCATOR_UNUSED)
+            {
+                if (allocator->nodes[candidate].dataSize >= size)
+                {
+                    nodeIndex = candidate;
+                    break;
+                }
+                candidate = allocator->nodes[candidate].binListNext;
+            }
+        }
+
+        if (nodeIndex == OFFSET_ALLOCATOR_UNUSED)
         {
             *allocation = NoSpaceAlloc;
             return false;
         }
-
-        // All leaf bins here fit the alloc, since the top bin was rounded up. Start leaf search from bit 0.
-        // NOTE: This search can't fail since at least one leaf bit was set because the top bit was set.
-        leafBinIndex = OffsetAllocator_tzcnt_nonzero(allocator->usedBins[topBinIndex]);
     }
-                
-    uint32_t binIndex = (topBinIndex << OFFSET_ALLOCATOR_TOP_BINS_INDEX_SHIFT) | leafBinIndex;
-        
+
     // Pop the top node of the bin. Bin top = node->next.
-    uint32_t nodeIndex = allocator->binIndices[binIndex];
     OffsetAllocatorNode* node = &allocator->nodes[nodeIndex];
     uint32_t nodeTotalSize = node->dataSize;
     node->dataSize = size;
     node->used = true;
-    allocator->binIndices[binIndex] = node->binListNext;
-    if (node->binListNext != OFFSET_ALLOCATOR_UNUSED) 
-        allocator->nodes[node->binListNext].binListPrev = OFFSET_ALLOCATOR_UNUSED;
+    if (allocator->binIndices[binIndex] == nodeIndex)
+    {
+        allocator->binIndices[binIndex] = node->binListNext;
+        if (node->binListNext != OFFSET_ALLOCATOR_UNUSED)
+            allocator->nodes[node->binListNext].binListPrev = OFFSET_ALLOCATOR_UNUSED;
+    }
+    else
+    {
+        if (node->binListPrev != OFFSET_ALLOCATOR_UNUSED)
+            allocator->nodes[node->binListPrev].binListNext = node->binListNext;
+        if (node->binListNext != OFFSET_ALLOCATOR_UNUSED)
+            allocator->nodes[node->binListNext].binListPrev = node->binListPrev;
+    }
     allocator->freeStorage -= nodeTotalSize;
 #ifdef OFFSET_ALLOCATOR_DEBUG_VERBOSE
     printf("Free storage: %u (-%u) (allocate)\n", allocator->freeStorage, nodeTotalSize);
@@ -607,9 +649,9 @@ void OffsetAllocator_Free(OffsetAllocator* allocator, OffsetAllocatorAllocation*
         
     // Insert the removed node to freelist
 #ifdef OFFSET_ALLOCATOR_DEBUG_VERBOSE
-    printf("Putting node %u into freelist[%u] (free)\n", nodeIndex, allocator->freeOffset + 1);
+    printf("Putting node %u into freelist[%u] (free)\n", nodeIndex, allocator->freeOffset);
 #endif
-    allocator->freeNodes[++allocator->freeOffset] = nodeIndex;
+    allocator->freeNodes[allocator->freeOffset++] = nodeIndex;
 
     // Insert the (combined) free node to bin
     uint32_t combinedNodeIndex = OffsetAllocator_InsertNodeIntoBin(allocator, size, offset);
